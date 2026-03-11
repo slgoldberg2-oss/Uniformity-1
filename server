@@ -1,0 +1,71 @@
+const express = require("express");
+const path    = require("path");
+const { PDFDocument } = require("pdf-lib");
+const puppeteer = require("puppeteer");
+
+const app  = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "../client/build")));
+
+function stripPIN(pin) { return String(pin).replace(/\D/g, ""); }
+
+// ── PDF only: Generate and merge property record PDFs ─────────────────────
+app.post("/api/property-records-pdf", async (req, res) => {
+  const { pins } = req.body;
+  if (!pins || !pins.length) return res.status(400).json({ error: "No PINs provided." });
+
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      headless: "new",
+      args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"],
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    });
+
+    const mergedPdf = await PDFDocument.create();
+
+    for (const pin of pins) {
+      const rawPin = stripPIN(pin);
+      const url = `https://www.cookcountyassessor.com/pin/${rawPin}/print?printImg=FALSE`;
+      console.log(`Fetching PDF for PIN: ${rawPin}`);
+      try {
+        const page = await browser.newPage();
+        await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+        const pdfBytes = await page.pdf({
+          format: "Letter",
+          printBackground: true,
+          margin: { top: "0.5in", bottom: "0.5in", left: "0.5in", right: "0.5in" },
+        });
+        await page.close();
+        const pinPdf      = await PDFDocument.load(pdfBytes);
+        const pagesToCopy = Math.min(2, pinPdf.getPageCount());
+        const copied      = await mergedPdf.copyPages(pinPdf, [...Array(pagesToCopy).keys()]);
+        copied.forEach(p => mergedPdf.addPage(p));
+      } catch (pinErr) {
+        console.warn(`Failed PDF for PIN ${rawPin}: ${pinErr.message}`);
+      }
+    }
+
+    const finalBytes = await mergedPdf.save();
+    res.set({
+      "Content-Type": "application/pdf",
+      "Content-Disposition": "attachment; filename=property_records.pdf",
+      "Content-Length": finalBytes.length,
+    });
+    res.send(Buffer.from(finalBytes));
+  } catch (err) {
+    console.error("PDF generation error:", err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (browser) await browser.close();
+  }
+});
+
+// ── Catch-all: serve React app ────────────────────────────────────────────
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "../client/build/index.html"));
+});
+
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
