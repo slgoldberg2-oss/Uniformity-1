@@ -1,0 +1,619 @@
+import { useState, useCallback } from "react";
+
+// ── Cook County API Base URLs (called directly from browser) ──────────────
+const PROPERTY_INFO_URL = "https://datacatalog.cookcountyil.gov/api/odata/v4/x54s-btds";
+const ASSESSMENT_URL    = "https://datacatalog.cookcountyil.gov/api/odata/v4/uzyt-m557";
+const SALES_URL         = "https://datacatalog.cookcountyil.gov/api/odata/v4/wvhk-k5uv";
+
+// ── Column alias maps ─────────────────────────────────────────────────────
+// Each entry is: canonical name → list of known aliases (checked in order)
+// resolve(row, "neighborhood") will find whichever key is actually present.
+const COL_ALIASES = {
+  // Property Info
+  pin:                  ["pin", "pin_number", "parid", "parcel_id"],
+  tax_year:             ["tax_year", "taxyear", "year", "tax_yr"],
+  class:                ["class", "class_code", "property_class", "prop_class", "char_class"],
+  township_code:        ["township_code", "township", "town_code", "twp_code", "triad_code"],
+  year_built:           ["year_built", "yearbuilt", "char_yrblt", "yr_built"],
+  building_sqft:        ["building_sqft", "bldg_sqft", "char_bldg_sf", "bldg_sf", "building_sq_ft", "char_total_bldg_sf"],
+  land_sqft:            ["land_sqft", "land_sq_ft", "char_land_sf", "land_sf"],
+  property_address:     ["property_address", "prop_address", "address", "mail_address", "prop_addr", "addr"],
+  neighborhood:         ["neighborhood", "nbhd", "nbhd_code", "neighborhood_code", "nbhd_num", "nbhd_name", "neighborhood_name"],
+  num_bedrooms:         ["num_bedrooms", "bedrooms", "char_beds", "bed_rooms", "num_beds"],
+  num_rooms:            ["num_rooms", "rooms", "char_rooms", "total_rooms"],
+  num_full_baths:       ["num_full_baths", "full_baths", "char_fbath", "full_bath"],
+  num_half_baths:       ["num_half_baths", "half_baths", "char_hbath", "half_bath"],
+  num_fireplaces:       ["num_fireplaces", "fireplaces", "char_frpl"],
+  type_of_residence:    ["type_of_residence", "residence_type", "char_type_resd", "res_type"],
+  construction_quality: ["construction_quality", "quality", "char_quality", "qual"],
+  garage_attached:      ["garage_attached", "gar_attached", "char_gar1_att"],
+  garage_size:          ["garage_size", "gar_size", "char_gar1_size"],
+  basement_type:        ["basement_type", "basement", "char_bsmt"],
+  ext_wall_material:    ["ext_wall_material", "ext_wall", "char_ext_wall"],
+  central_heating:      ["central_heating", "heat", "char_heat"],
+  basement_finish:      ["basement_finish", "bsmt_finish", "char_bsmt_fin"],
+  roof_material:        ["roof_material", "roof", "char_roof_cnst"],
+  central_air:          ["central_air", "air_conditioning", "char_air"],
+
+  // Assessment
+  mailed_bldg:          ["mailed_bldg", "mail_bldg", "bldg_av", "av_bldg", "assessed_bldg"],
+  mailed_land:          ["mailed_land", "mail_land", "land_av", "av_land", "assessed_land"],
+  mailed_tot:           ["mailed_tot",  "mail_tot",  "tot_av",  "av_total", "assessed_total"],
+  certified_bldg:       ["certified_bldg", "cert_bldg", "board_bldg", "bor_bldg"],
+  certified_land:       ["certified_land", "cert_land", "board_land", "bor_land"],
+  certified_tot:        ["certified_tot",  "cert_tot",  "board_tot",  "bor_tot"],
+  township_name:        ["township_name", "township", "town_name", "twp_name", "triad_name"],
+  neighborhood_code:    ["neighborhood_code", "nbhd_code", "nbhd", "neighborhood", "nbhd_num"],
+
+  // Sales
+  sale_date:            ["sale_date", "saledate", "date_of_sale", "sale_dt"],
+  sale_price:           ["sale_price", "saleprice", "price", "sale_amt", "amount"],
+  sale_document_number: ["sale_document_number", "doc_number", "document_number", "document_no", "doc_no", "sale_doc_num"],
+  sale_deed_type:       ["sale_deed_type", "deed_type", "deedtype", "instrument_type"],
+};
+
+/**
+ * Resolve a canonical field name from a row object.
+ * Returns the value of the first matching alias key found, or undefined.
+ */
+function resolve(row, canonical) {
+  if (!row) return undefined;
+  const aliases = COL_ALIASES[canonical] || [canonical];
+  for (const alias of aliases) {
+    // exact match
+    if (alias in row) return row[alias];
+    // case-insensitive match
+    const lower = alias.toLowerCase();
+    const key   = Object.keys(row).find(k => k.toLowerCase() === lower);
+    if (key) return row[key];
+  }
+  return undefined;
+}
+
+/**
+ * Build a $select string from canonical names, but since we don't know the
+ * actual column names ahead of time we intentionally omit $select for small
+ * fetches and rely on resolve() to find the right field. For large township
+ * fetches we still pass $select with all known aliases to avoid over-fetching,
+ * but fall back gracefully via resolve().
+ *
+ * Actually: OData $select with unknown column names causes an error, so we
+ * only use $select when we know the column names. For unknown/variable columns
+ * we drop $select and let resolve() handle it.
+ */
+
+// ── OData fetch ───────────────────────────────────────────────────────────
+async function odata(base, filter, select, top = 500) {
+  const params = new URLSearchParams();
+  if (filter) params.set("$filter", filter);
+  if (select) params.set("$select", select);
+  if (top)    params.set("$top", String(top));
+  const resp = await fetch(`${base}?${params.toString()}`);
+  if (!resp.ok) throw new Error(`Cook County API error ${resp.status}`);
+  const json = await resp.json();
+  return json.value ?? [];
+}
+
+/**
+ * Fetch one row to discover actual column names for a dataset, then
+ * build a $select string using the discovered names for the canonical fields
+ * we care about. Falls back to fetching without $select if discovery fails.
+ */
+async function discoverColumns(base, canonicals) {
+  try {
+    const sample = await odata(base, null, null, 1);
+    if (!sample.length) return null;
+    const row = sample[0];
+    const selected = [];
+    for (const canonical of canonicals) {
+      const aliases = COL_ALIASES[canonical] || [canonical];
+      for (const alias of aliases) {
+        const lower = alias.toLowerCase();
+        const key   = Object.keys(row).find(k => k.toLowerCase() === lower);
+        if (key) { selected.push(key); break; }
+      }
+    }
+    return selected.length ? selected.join(",") : null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Formatters ────────────────────────────────────────────────────────────
+function formatPIN(raw) {
+  const d = String(raw).replace(/\D/g, "");
+  if (d.length !== 14) return raw;
+  return `${d.slice(0,2)}-${d.slice(2,4)}-${d.slice(4,7)}-${d.slice(7,10)}-${d.slice(10,14)}`;
+}
+function stripPIN(pin)  { return String(pin).replace(/\D/g, ""); }
+function dollarFmt(n)   { return n == null ? "—" : `$${Math.round(n).toLocaleString()}`; }
+function dollarDec(n)   { return n == null ? "—" : `$${Number(n).toFixed(2)}`; }
+function dateFmt(d)     { return d ? new Date(d).toLocaleDateString("en-US") : "—"; }
+function csvEscape(v)   { const s = String(v ?? ""); return s.includes(",") ? `"${s}"` : s; }
+function parsePINParts(pin) {
+  const d = stripPIN(pin);
+  return { township: d.slice(0,2), block: d.slice(2,4), parcel: d.slice(4,7) };
+}
+function f(row, col)    { return resolve(row, col); } // shorthand
+
+function downloadCSV(rows, filename) {
+  const csv  = rows.map(r => r.map(csvEscape).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────
+export default function App() {
+  const [taxYear, setTaxYear]         = useState("");
+  const [pins, setPins]               = useState([""]);
+  const [stage, setStage]             = useState("assessor");
+  const [loading, setLoading]         = useState(false);
+  const [loadingStep, setLoadingStep] = useState("");
+  const [pdfLoading, setPdfLoading]   = useState(false);
+  const [error, setError]             = useState("");
+  const [result, setResult]           = useState(null);
+
+  const addPin    = ()        => setPins(p => [...p, ""]);
+  const removePin = i         => setPins(p => p.filter((_, j) => j !== i));
+  const updatePin = (i, val)  => setPins(p => p.map((v, j) => j === i ? val : v));
+
+  // ── Core analysis ─────────────────────────────────────────────────────
+  const runAnalysis = useCallback(async () => {
+    setError(""); setResult(null);
+    const yr        = taxYear.trim();
+    const cleanPins = pins.map(p => stripPIN(p.trim())).filter(Boolean);
+    if (!yr || !cleanPins.length) { setError("Please enter a tax year and at least one PIN."); return; }
+
+    setLoading(true);
+    const bldgField = stage === "assessor" ? "mailed_bldg"  : "certified_bldg";
+    const landField = stage === "assessor" ? "mailed_land"  : "certified_land";
+
+    try {
+      // ── 1. Discover actual column names (one sample fetch per dataset) ──
+      setLoadingStep("Detecting API column names…");
+      const [propInfoSelect, assessSelect, salesSelect] = await Promise.all([
+        discoverColumns(PROPERTY_INFO_URL, [
+          "pin","tax_year","class","township_code","year_built","building_sqft",
+          "land_sqft","property_address","neighborhood",
+        ]),
+        discoverColumns(ASSESSMENT_URL, [
+          "pin","tax_year","mailed_bldg","mailed_land","mailed_tot",
+          "certified_bldg","certified_land","certified_tot",
+          "township_name","neighborhood_code",
+        ]),
+        discoverColumns(SALES_URL, [
+          "pin","township_name","class","sale_date","sale_price",
+          "sale_document_number","sale_deed_type","neighborhood",
+        ]),
+      ]);
+
+      // ── 2. Subject property info & assessments ──────────────────────────
+      setLoadingStep("Fetching subject property data…");
+      const pinFilter = cleanPins.map(p => `pin eq '${p}'`).join(" or ");
+
+      const [subjectInfoArr, subjectAssessArr] = await Promise.all([
+        odata(PROPERTY_INFO_URL, `(${pinFilter}) and tax_year eq ${yr}`, propInfoSelect),
+        odata(ASSESSMENT_URL,    `(${pinFilter}) and tax_year eq ${yr}`, assessSelect),
+      ]);
+
+      if (!subjectInfoArr.length)   throw new Error("No property info found for the entered PIN(s) and tax year.");
+      if (!subjectAssessArr.length) throw new Error("No assessment data found for the entered PIN(s) and tax year.");
+
+      const subjectInfo      = subjectInfoArr[0];
+      const subjectAssessRef = subjectAssessArr[0];
+
+      const subjectBldgAssess  = subjectAssessArr.reduce((s, r) => s + (parseFloat(f(r, bldgField)) || 0), 0);
+      const subjectLandAssess  = subjectAssessArr.reduce((s, r) => s + (parseFloat(f(r, landField)) || 0), 0); // eslint-disable-line no-unused-vars
+      const subjectBldgSqft    = parseFloat(f(subjectInfo, "building_sqft")) || 1;
+      const subjectBldgPerSqft = subjectBldgAssess / subjectBldgSqft;
+      const subjectTownship    = String(f(subjectInfo, "township_code") || "").padStart(2, "0");
+      const subjectClass       = String(f(subjectInfo, "class") || "");
+      const subjectTownshipName= f(subjectAssessRef, "township_name") || "";
+      const subjectPINparts    = parsePINParts(cleanPins[0]);
+
+      // ── 3. Uniformity: all props in same township ───────────────────────
+      setLoadingStep("Searching township for comparable properties…");
+      const [allInfoArr, allAssessArr] = await Promise.all([
+        odata(PROPERTY_INFO_URL,
+          `township_code eq '${subjectTownship}' and tax_year eq ${yr}`,
+          propInfoSelect, 5000),
+        odata(ASSESSMENT_URL,
+          `township_name eq '${subjectTownshipName}' and tax_year eq ${yr}`,
+          assessSelect, 5000),
+      ]);
+
+      const assessMap = {};
+      for (const a of allAssessArr) {
+        const pin = f(a, "pin");
+        if (pin) assessMap[pin] = a;
+      }
+
+      const candidates = [];
+      for (const info of allInfoArr) {
+        const pin = f(info, "pin");
+        if (!pin || cleanPins.includes(pin)) continue;
+        const assess  = assessMap[pin];
+        if (!assess) continue;
+        const bldg    = parseFloat(f(assess, bldgField)) || 0;
+        const sqft    = parseFloat(f(info, "building_sqft")) || 1;
+        const perSqft = bldg / sqft;
+        if (perSqft <= 0 || perSqft >= subjectBldgPerSqft) continue;
+        const parts      = parsePINParts(pin);
+        const blockDiff  = Math.abs(parseInt(parts.block,  10) - parseInt(subjectPINparts.block,  10));
+        const parcelDiff = Math.abs(parseInt(parts.parcel, 10) - parseInt(subjectPINparts.parcel, 10));
+        candidates.push({ pin, info, assess, bldg, sqft, perSqft, blockDiff, parcelDiff });
+      }
+
+      const totalLower = candidates.length;
+      candidates.sort((a, b) => {
+        if (a.blockDiff  !== b.blockDiff)  return a.blockDiff  - b.blockDiff;
+        if (a.parcelDiff !== b.parcelDiff) return a.parcelDiff - b.parcelDiff;
+        return a.perSqft - b.perSqft;
+      });
+      const top4 = candidates.slice(0, 4);
+
+      // Build subject & comp objects using resolve() for every field
+      const uniSubject = {
+        pin:          formatPIN(cleanPins[0]),
+        age:          f(subjectInfo, "year_built") ? parseInt(yr) - parseInt(f(subjectInfo, "year_built")) : null,
+        class:        subjectClass,
+        address:      f(subjectInfo, "property_address") || "",
+        neighborhood: f(subjectInfo, "neighborhood") || f(subjectAssessRef, "neighborhood_code") || "",
+        bldgSqft:     subjectBldgSqft,
+        bldgAssess:   subjectBldgAssess,
+        bldgPerSqft:  subjectBldgPerSqft,
+      };
+
+      const uniComps = top4.map(c => ({
+        pin:          formatPIN(c.pin),
+        age:          f(c.info, "year_built") ? parseInt(yr) - parseInt(f(c.info, "year_built")) : null,
+        class:        f(c.info, "class") || "",
+        address:      f(c.info, "property_address") || "",
+        neighborhood: f(c.info, "neighborhood") || f(c.assess, "neighborhood_code") || "",
+        bldgSqft:     c.sqft,
+        bldgAssess:   c.bldg,
+        bldgPerSqft:  c.perSqft,
+      }));
+
+      // ── 4. Sales comparison ─────────────────────────────────────────────
+      setLoadingStep("Searching comparable sales…");
+      const yearStart = parseInt(yr) - 3;
+
+      const salesArr = await odata(SALES_URL,
+        `township_name eq '${subjectTownshipName}' and class eq '${subjectClass}' and sale_deed_type eq 'Warranty'`,
+        salesSelect, 2000);
+
+      const filteredSales = salesArr.filter(s => {
+        const sd = f(s, "sale_date");
+        if (!sd) return false;
+        const saleYr = new Date(sd).getFullYear();
+        return saleYr >= yearStart && saleYr <= parseInt(yr);
+      });
+
+      // Batch fetch assessments & sqft for sale PINs
+      setLoadingStep("Computing implied sale assessments…");
+      const salePINs      = [...new Set(filteredSales.map(s => f(s, "pin")).filter(Boolean))];
+      const saleAssessMap = {};
+      const salePropMap   = {};
+      const CHUNK = 50;
+
+      for (let i = 0; i < salePINs.length; i += CHUNK) {
+        const chunk = salePINs.slice(i, i + CHUNK);
+        const filt  = chunk.map(p => `pin eq '${p}'`).join(" or ");
+        const [aArr, pArr] = await Promise.all([
+          odata(ASSESSMENT_URL,    `(${filt}) and tax_year eq ${yr}`, assessSelect, CHUNK + 5),
+          odata(PROPERTY_INFO_URL, `(${filt}) and tax_year eq ${yr}`, propInfoSelect, CHUNK + 5),
+        ]);
+        for (const a of aArr) { const p = f(a,"pin"); if (p) saleAssessMap[p] = a; }
+        for (const p of pArr) { const pin = f(p,"pin"); if (pin) salePropMap[pin] = p; }
+      }
+
+      const saleComputations = [];
+      for (const s of filteredSales) {
+        const pin       = f(s, "pin");
+        const salePrice = parseFloat(f(s, "sale_price")) || 0;
+        const landA     = parseFloat(f(saleAssessMap[pin] || {}, landField)) || 0;
+        const bldgA     = salePrice * 0.10 - landA;
+        const sqft      = parseFloat(f(salePropMap[pin]  || {}, "building_sqft")) || 1;
+        const perSqft   = bldgA / sqft;
+        if (perSqft <= 0 || perSqft >= subjectBldgPerSqft) continue;
+        saleComputations.push({ ...s, pin, bldgAssess: bldgA, bldgSqft: sqft, bldgPerSqft: perSqft });
+      }
+
+      saleComputations.sort((a, b) => new Date(f(b,"sale_date")) - new Date(f(a,"sale_date")));
+      const top4Sales = saleComputations.slice(0, 4);
+
+      const salesSubject = {
+        pin:                  formatPIN(cleanPins[0]),
+        neighborhood:         uniSubject.neighborhood,
+        class:                subjectClass,
+        sale_date:            null,
+        sale_price:           null,
+        sale_document_number: null,
+        sale_deed_type:       null,
+      };
+
+      const salesComps = top4Sales.map(s => ({
+        pin:                  formatPIN(f(s, "pin")),
+        neighborhood:         f(s, "neighborhood") || "",
+        class:                f(s, "class") || "",
+        sale_date:            f(s, "sale_date"),
+        sale_price:           parseFloat(f(s, "sale_price")) || null,
+        sale_document_number: f(s, "sale_document_number") || "",
+        sale_deed_type:       f(s, "sale_deed_type") || "",
+      }));
+
+      setResult({
+        uniformity: { subject: uniSubject, comps: uniComps, totalLower },
+        sales:      { subject: salesSubject, comps: salesComps },
+      });
+
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+      setLoadingStep("");
+    }
+  }, [taxYear, pins, stage]);
+
+  // ── PDF download ──────────────────────────────────────────────────────
+  const downloadPropertyRecords = useCallback(async () => {
+    if (!result) return;
+    setPdfLoading(true);
+    try {
+      const allPins = [result.uniformity.subject.pin, ...result.uniformity.comps.map(c => c.pin)];
+      const resp = await fetch("/api/property-records-pdf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pins: allPins }),
+      });
+      if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || "PDF failed"); }
+      const blob = await resp.blob();
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href = url; a.download = "property_records.pdf"; a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError("PDF Error: " + e.message);
+    } finally {
+      setPdfLoading(false);
+    }
+  }, [result]);
+
+  // ── CSV downloads ─────────────────────────────────────────────────────
+  const downloadUniCSV = () => {
+    if (!result) return;
+    const { subject, comps } = result.uniformity;
+    const header = ["Label","PIN","Age","Class","Property Address","Neighborhood","Building Sq Ft","Building Assessment","Bldg Assess/Sq Ft"];
+    const toRow  = (label, r) => [label, r.pin, r.age ?? "—", r.class, r.address, r.neighborhood,
+      r.bldgSqft, Math.round(r.bldgAssess), Number(r.bldgPerSqft).toFixed(2)];
+    downloadCSV([header, toRow("Subject Property", subject), ...comps.map((c,i) => toRow(`Comparable #${i+1}`, c))],
+      "uniformity_analysis.csv");
+  };
+
+  const downloadSalesCSV = () => {
+    if (!result) return;
+    const { subject, comps } = result.sales;
+    const header = ["Label","PIN","Neighborhood","Class","Sale Date","Sale Price","Doc Number","Deed Type"];
+    const toRow  = (label, r) => [label, r.pin, r.neighborhood, r.class,
+      r.sale_date ? dateFmt(r.sale_date) : "—",
+      r.sale_price != null ? dollarFmt(r.sale_price) : "—",
+      r.sale_document_number || "—", r.sale_deed_type || "—"];
+    downloadCSV([header, toRow("Subject Property", subject), ...comps.map((c,i) => toRow(`Comparable #${i+1}`, c))],
+      "sales_comparison.csv");
+  };
+
+  // ── Render ────────────────────────────────────────────────────────────
+  return (
+    <div style={S.page}>
+      <header style={S.header}>
+        <div style={S.headerInner}>
+          <div style={S.headerLabel}>Cook County · Illinois</div>
+          <div style={S.headerTitle}>Uniformity &amp; Sales Analysis</div>
+          <div style={S.headerSub}>Live data fetched directly from Cook County Open Data Portal</div>
+        </div>
+      </header>
+
+      <main style={S.main}>
+        {/* Input Card */}
+        <div style={S.card}>
+          <SectionHeader title="Enter Analysis Parameters" />
+          <div style={S.row}>
+            <div>
+              <label style={S.label}>Tax Year</label>
+              <input style={S.input} type="number" placeholder="e.g. 2023"
+                value={taxYear} onChange={e => setTaxYear(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && runAnalysis()} />
+            </div>
+            <div>
+              <label style={S.label}>Valuation Stage</label>
+              <div style={S.toggle}>
+                {[["assessor","Assessor"],["board","Board of Review"]].map(([val, lbl]) => (
+                  <button key={val} onClick={() => setStage(val)}
+                    style={{ ...S.toggleBtn, ...(stage === val ? S.toggleBtnActive : {}) }}>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 20 }}>
+            <label style={S.label}>Subject Property PIN(s)</label>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {pins.map((pin, i) => (
+                <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input style={{ ...S.input, width: 220, fontFamily: "monospace", letterSpacing: 1 }}
+                    placeholder="##-##-###-###-####" value={pin}
+                    onChange={e => updatePin(i, e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && runAnalysis()} />
+                  {pins.length > 1 && <button onClick={() => removePin(i)} style={S.removeBtn}>✕</button>}
+                </div>
+              ))}
+              <button onClick={addPin} style={S.addBtn}>+ Add PIN</button>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 24 }}>
+            <button onClick={runAnalysis} disabled={loading}
+              style={{ ...S.primaryBtn, opacity: loading ? 0.7 : 1, cursor: loading ? "not-allowed" : "pointer" }}>
+              {loading
+                ? <span style={{ display:"flex", alignItems:"center", gap:8 }}><Spinner />{loadingStep || "Running Analysis…"}</span>
+                : "Complete Analysis"}
+            </button>
+          </div>
+          {error && <div style={S.errorBox}><strong>Error:</strong> {error}</div>}
+        </div>
+
+        {/* Uniformity Analysis */}
+        {result?.uniformity && (
+          <div style={S.card}>
+            <div style={S.tableHeader}>
+              <div>
+                <SectionHeader title="Uniformity Analysis" />
+                <p style={S.subtext}>
+                  <strong>{result.uniformity.totalLower.toLocaleString()}</strong> properties in this
+                  township have a lower building assessment per square foot than the subject property.
+                </p>
+              </div>
+              <div style={S.btnGroup}>
+                <button onClick={downloadUniCSV} style={S.secondaryBtn}>⬇ Download CSV</button>
+                <button onClick={downloadPropertyRecords} disabled={pdfLoading}
+                  style={{ ...S.secondaryBtn, background: pdfLoading ? "#6b7280" : "#1e4d2b" }}>
+                  {pdfLoading
+                    ? <span style={{ display:"flex", alignItems:"center", gap:6 }}><Spinner size={12} />Generating…</span>
+                    : "⬇ Download Property Records"}
+                </button>
+              </div>
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={S.table}>
+                <thead>
+                  <tr>{["","PIN","Age","Class","Property Address","Neighborhood","Bldg Sq Ft","Bldg Assessment","Bldg Assess/Sq Ft"].map(h =>
+                    <th key={h} style={S.th}>{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  <UniRow label="Subject Property" row={result.uniformity.subject} highlight />
+                  {result.uniformity.comps.map((c,i) => <UniRow key={i} label={`Comparable #${i+1}`} row={c} />)}
+                  {result.uniformity.comps.length === 0 &&
+                    <tr><td colSpan={9} style={{ ...S.td, textAlign:"center", color:"#6b7280", padding:"20px" }}>No comparable properties found.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Sales Comparison */}
+        {result?.sales && (
+          <div style={S.card}>
+            <div style={S.tableHeader}>
+              <div>
+                <SectionHeader title="Comparable Sales Analysis" />
+                <p style={S.subtext}>
+                  Recent warranty deed sales in the same township and class with a lower implied
+                  building assessment per square foot than the subject property.
+                </p>
+              </div>
+              <button onClick={downloadSalesCSV} style={S.secondaryBtn}>⬇ Download CSV</button>
+            </div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={S.table}>
+                <thead>
+                  <tr>{["","PIN","Neighborhood","Class","Sale Date","Sale Price","Document #","Deed Type"].map(h =>
+                    <th key={h} style={S.th}>{h}</th>)}</tr>
+                </thead>
+                <tbody>
+                  <SalesRow label="Subject Property" row={result.sales.subject} highlight />
+                  {result.sales.comps.map((c,i) => <SalesRow key={i} label={`Comparable #${i+1}`} row={c} />)}
+                  {result.sales.comps.length === 0 &&
+                    <tr><td colSpan={8} style={{ ...S.td, textAlign:"center", color:"#6b7280", padding:"20px" }}>No comparable sales found within 3 years.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </main>
+
+      <footer style={S.footer}>
+        Data sourced live from the Cook County Open Data Portal &nbsp;·&nbsp; Assessment data subject to change
+      </footer>
+    </div>
+  );
+}
+
+// ── Table rows ─────────────────────────────────────────────────────────────
+function UniRow({ label, row, highlight }) {
+  return (
+    <tr style={{ background: highlight ? "#eef2fa" : "transparent" }}>
+      <td style={{ ...S.td, fontWeight:700, color:"#1a2744", whiteSpace:"nowrap" }}>{label}</td>
+      <td style={{ ...S.td, fontFamily:"monospace", fontSize:12 }}>{row.pin}</td>
+      <td style={S.td}>{row.age ?? "—"}</td>
+      <td style={S.td}>{row.class || "—"}</td>
+      <td style={S.td}>{row.address || "—"}</td>
+      <td style={S.td}>{row.neighborhood || "—"}</td>
+      <td style={{ ...S.td, textAlign:"right" }}>{row.bldgSqft ? Number(row.bldgSqft).toLocaleString() : "—"}</td>
+      <td style={{ ...S.td, textAlign:"right" }}>{dollarFmt(row.bldgAssess)}</td>
+      <td style={{ ...S.td, textAlign:"right" }}>{typeof row.bldgPerSqft === "number" ? dollarDec(row.bldgPerSqft) : "—"}</td>
+    </tr>
+  );
+}
+
+function SalesRow({ label, row, highlight }) {
+  return (
+    <tr style={{ background: highlight ? "#eef2fa" : "transparent" }}>
+      <td style={{ ...S.td, fontWeight:700, color:"#1a2744", whiteSpace:"nowrap" }}>{label}</td>
+      <td style={{ ...S.td, fontFamily:"monospace", fontSize:12 }}>{row.pin}</td>
+      <td style={S.td}>{row.neighborhood || "—"}</td>
+      <td style={S.td}>{row.class || "—"}</td>
+      <td style={S.td}>{row.sale_date ? dateFmt(row.sale_date) : "—"}</td>
+      <td style={{ ...S.td, textAlign:"right" }}>{row.sale_price != null ? dollarFmt(row.sale_price) : "—"}</td>
+      <td style={S.td}>{row.sale_document_number || "—"}</td>
+      <td style={S.td}>{row.sale_deed_type || "—"}</td>
+    </tr>
+  );
+}
+
+function SectionHeader({ title }) {
+  return <div style={{ fontSize:16, fontWeight:700, color:"#1a2744", fontFamily:"'Libre Baskerville',Georgia,serif", marginBottom:4 }}>{title}</div>;
+}
+
+function Spinner({ size = 14 }) {
+  return <span style={{ display:"inline-block", width:size, height:size, border:"2px solid rgba(255,255,255,0.3)", borderTop:"2px solid #fff", borderRadius:"50%", animation:"spin 0.7s linear infinite" }} />;
+}
+
+// ── Styles ────────────────────────────────────────────────────────────────
+const S = {
+  page:            { fontFamily:"'Source Sans 3','Segoe UI',sans-serif", background:"#f4f1eb", minHeight:"100vh", display:"flex", flexDirection:"column" },
+  header:          { background:"#1a2744", color:"#fff", padding:"24px 40px 20px", boxShadow:"0 2px 12px rgba(0,0,0,0.2)" },
+  headerInner:     { maxWidth:1160, margin:"0 auto" },
+  headerLabel:     { fontSize:11, letterSpacing:3, textTransform:"uppercase", color:"#7a9abf", marginBottom:4 },
+  headerTitle:     { fontSize:26, fontWeight:700, fontFamily:"'Libre Baskerville',Georgia,serif", letterSpacing:0.3 },
+  headerSub:       { fontSize:12, color:"#8aabcc", marginTop:4 },
+  main:            { maxWidth:1160, margin:"32px auto", padding:"0 24px", flex:1, width:"100%", boxSizing:"border-box" },
+  card:            { background:"#fff", borderRadius:8, boxShadow:"0 1px 10px rgba(0,0,0,0.07)", padding:"24px 28px", marginBottom:24, border:"1px solid #ddd8ce" },
+  row:             { display:"flex", gap:24, flexWrap:"wrap", alignItems:"flex-end", marginTop:4 },
+  label:           { display:"block", fontSize:11, fontWeight:700, color:"#4b5563", marginBottom:5, textTransform:"uppercase", letterSpacing:0.6 },
+  input:           { border:"1px solid #c5c0b4", borderRadius:4, padding:"8px 12px", fontSize:14, fontFamily:"inherit", outline:"none", width:130, boxSizing:"border-box", background:"#faf9f7", color:"#111" },
+  toggle:          { display:"flex", border:"1px solid #c5c0b4", borderRadius:4, overflow:"hidden" },
+  toggleBtn:       { padding:"8px 16px", background:"#faf9f7", color:"#555", border:"none", cursor:"pointer", fontFamily:"inherit", fontSize:13, fontWeight:400 },
+  toggleBtnActive: { background:"#1a2744", color:"#fff", fontWeight:700 },
+  removeBtn:       { background:"none", border:"1px solid #d1cdc4", borderRadius:4, cursor:"pointer", fontSize:12, color:"#9ca3af", padding:"4px 9px" },
+  addBtn:          { background:"none", border:"1px dashed #1a2744", borderRadius:4, color:"#1a2744", cursor:"pointer", fontSize:12, padding:"5px 14px", fontFamily:"inherit", alignSelf:"flex-start", marginTop:4 },
+  primaryBtn:      { background:"#1a2744", color:"#fff", border:"none", borderRadius:5, padding:"11px 32px", fontSize:14, fontWeight:700, cursor:"pointer", fontFamily:"inherit", letterSpacing:0.3, boxShadow:"0 2px 6px rgba(0,0,0,0.15)", display:"inline-flex", alignItems:"center", gap:8 },
+  secondaryBtn:    { background:"#1a2744", color:"#fff", border:"none", borderRadius:4, padding:"7px 14px", fontSize:12, cursor:"pointer", fontFamily:"inherit", fontWeight:600, display:"inline-flex", alignItems:"center", gap:6 },
+  errorBox:        { marginTop:14, color:"#991b1b", fontSize:13, background:"#fef2f2", border:"1px solid #fca5a5", borderRadius:4, padding:"10px 14px" },
+  tableHeader:     { display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:16, borderBottom:"2px solid #1a2744", paddingBottom:12, flexWrap:"wrap", gap:12 },
+  btnGroup:        { display:"flex", gap:8, flexWrap:"wrap" },
+  subtext:         { fontSize:12, color:"#6b7280", margin:"4px 0 0" },
+  table:           { width:"100%", borderCollapse:"collapse", fontSize:13 },
+  th:              { background:"#1a2744", color:"#fff", padding:"10px 13px", textAlign:"left", fontWeight:600, fontSize:11.5, letterSpacing:0.4, whiteSpace:"nowrap", borderRight:"1px solid rgba(255,255,255,0.12)" },
+  td:              { padding:"9px 13px", borderBottom:"1px solid #ece8e0", verticalAlign:"middle", fontSize:13 },
+  footer:          { textAlign:"center", fontSize:11, color:"#9ca3af", padding:"24px 0", borderTop:"1px solid #e5e0d8", background:"#f4f1eb" },
+};
+
+const styleSheet = document.createElement("style");
+styleSheet.textContent = `@keyframes spin { to { transform: rotate(360deg); } }`;
+document.head.appendChild(styleSheet);
